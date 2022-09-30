@@ -1,0 +1,1492 @@
+---
+title: "Analysis of Kickstarter data between 2009 and 2017"
+output: 
+  html_document:
+    code_folding: show
+    df_print: paged
+---
+
+##  SUMMARY
+
+I analyzed the data on projects listed on the crowdfunding platform [Kickstarter](https://www.kickstarter.com/), which was collected and posted on Kaggle. The data spans the years between 2009 and 2017. I discovered that the platform hit peak use in 2015 and slowly regressed in the following two years.
+
+The analysis by categories showed that the three categories that raised the most funding and had the most backers were Games, Design and Technology. The three categories that had the highest project success rate were however Dance, Theater and Comics.
+
+Comparison between the use of the platform in the EU vs. US showed no significant difference in the type of projects that were successful. The overall project success was lower in the EU, however.
+
+I also performed sentiment analysis using BING and AFINN lexicons on the project titles to see if the sentiment value of the title had any effect on project success. It turned out that the effect was very limited to none.
+
+I trained a Logistic Regression model, a Random Forest model, a Generalized Boosted Regression Model and an eXtreme Gradient Boosting model. It turned out that GBM had the best performance, so I tuned it further to achieve optimal performance in predicting the success of a project.
+
+Finally, I wrote a wrapper function to predict the project success rate by plugging in the project information and name.
+
+
+## OVERVIEW
+
+The data for this project was downloaded from [Kaggle](https://www.kaggle.com/datasets/kemical/kickstarter-projects).
+
+The data contains records of every Kickstarter project launched between 2009 and early 2018. It contains information about the project names, categories, goals, number of backers, amounts pledged when it was launched and the deadline, as well as the state of the project.
+
+The goal of my analysis is to get a sense of how the platform's popularity has been evolving in the time period between 2009 and 2017 and a comparison of the performance of different categories on the platform. I will compare the platform and categories on several metrics. 
+
+I will also perform a sentimental analysis to try to discover whether the sentiment of the project's title has any effect on the project's funding outcome. 
+
+Additionally, I will train some different classification models that will output the predicted probabilities of a project's success rate.
+
+Finally, I will construct a simple wrapper function to predict the probability of success of a project where we can directly input the project parameters.
+
+## GETTING STARTED
+
+Let's begin by loading the required packages.
+```{r, message=FALSE, warning=FALSE, class.source = "fold-hide"}
+############## Packages
+library(tidyverse)
+library(lubridate)
+library(tidytext)
+library(tm)
+library(wordcloud2)
+library(ROSE)
+library(randomForest)
+library(caret)
+library(pROC)
+library(gbm)
+library(xgboost)
+library(ggthemes)
+library(paletteer)
+library(mlr3)
+library(mlr3learners)
+library(mlr3pipelines)
+library(mlr3tuning)
+library(assertive.base)
+library(patchwork)
+library(glmnet)
+library(doParallel)
+```
+
+I will also define a custom theme to unify the graph's appearance.
+```{r, class.source = "fold-hide"}
+theme_fistro <- function() {
+  theme_minimal() %+replace%
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.ticks = element_blank(),
+      
+      plot.title = element_text(
+        family = "NimbusSan",
+        size = 17,
+        hjust = 0.9,
+        vjust = -3),
+      
+      axis.text = element_text(
+        family = "NimbusSan"),
+      
+      plot.background = element_rect(fill = "#FFFFF7")
+    )
+}
+```
+
+We load the data and take a quick look.
+```{r, message=FALSE, class.source = "fold-hide"}
+filepath <- "D:/Users/Gregor/Desktop/Kaggle/Kickstarter projects/ks-projects-201801.csv" 
+kickstarter_data <- read_csv(filepath, col_names = T)
+glimpse(kickstarter_data)
+```
+We see that there are a few variables that aren't self-explanatory. 'usd pledged' is the conversion of the pledged data by Kickstarter, and usd_pledged_real and usd_goal_real are conversions from the [Fixer.io API](https://fixer.io/).
+
+## DATA EXPLORATION
+
+We see that during the import, some variables were classified as character types even though factor types would be more suitable. So we transform them into the correct types.
+```{r}
+kickstarter_data <- kickstarter_data %>%
+  mutate(category = factor(category),
+         main_category = factor(main_category),
+         currency = factor(currency),
+         state = factor(state),
+         country = factor(country))
+
+summary(kickstarter_data)
+```
+Upon first inspection, we see that the data looks quite clean. A few things that stand out are some projects launched in 1970, a few projects with missing information about the country, and some NA's in the variable 'usd pledged'.
+
+
+First, we take a closer look at the cases with the date of 1970.
+```{r, class.source = "fold-hide"}
+kickstarter_data[year(kickstarter_data$launched) == 1970, ]
+```
+We can see only 7 examples of projects that started in 1970. 6 of these have deadlines in 2010 and one has a deadline in 2015. There is no apparent pattern, and we can speculate that it was some kind of error during data scraping. Given that there are only 7 cases without any obvious patterns between them, we can safely remove them.
+
+Next, we take a look at a few sample examples of projects without the country information.
+```{r, class.source = "fold-hide"}
+set.seed(2000)
+kickstarter_data[kickstarter_data$country == 'N,0"', ][sample(1:3797, 20), ]
+```
+There is no obvious pattern we can see in the data with the missing country information apart from the two common characteristics between them:
+ - the number of backers is always 0  
+ - it appears that the projects with missing country information also have missing information about the USD pledged amount (3797 NA's in both variables). So we'll see if that holds true for all cases.
+
+```{r}
+identical(which(kickstarter_data$country == 'N,0"'), which(is.na(kickstarter_data$`usd pledged`)))
+```
+The test confirms that the projects with missing information about the country are also missing information about their funding goal. We can speculate that an error occurred during data scraping, as there is no obvious systematic bias in the missing data. Therefore, we can remove the observations with the missing values.
+
+In addition, we look for any additional NA's that we might have missed.
+
+```{r}
+sapply(kickstarter_data, function(x) sum(is.na(x)))
+```
+We find 4 projects with missing names, so we take a closer look.
+
+```{r, class.source = "fold-hide"}
+(kickstarter_data[which(is.na(kickstarter_data$name)), ]) 
+```
+Again, no clear patterns between the cases. As there are only 4, we will remove them.
+
+
+
+## DATA CLEANING
+
+In the first step of data cleaning, we remove records with the missing observations. We also remove the records from the year 2018. Because the data was scraped in January 2018, the status of the projects launched in 2018 is mostly live and therefore not useful for our analysis.
+
+```{r}
+kickstarter_clean <- kickstarter_data %>%
+  filter(!(year(launched) %in% c(1970, 2018))) %>% #We remove the projects from 1970 and 2018
+  filter(!(country == 'N,0"')) %>% #We remove the projects with missing information about the countries
+  filter(!is.na(name))
+
+sapply(kickstarter_clean, function(x) sum(is.na(x)))
+```
+
+Our data cleaning seemed to be successful, as there are no NA's left in the cleaned dataset. 
+
+To make our lives easier, we do some data manipulation on the dataset. We recode the status of the project into a binary category-successful or failed. We also transform the launch_year variable to just the year, as the increased accuracy of the datetime is not important in our case.
+```{r}
+kickstarter_clean <- kickstarter_clean %>%
+  filter(state %in% c("failed", "canceled", "successful", "suspended")) %>% #Omitting live and undefined projects
+  mutate(state_bi = factor(ifelse(state == "successful", 1, 0))) %>% #Creating a factor -> 1 for a successful project, 0 otherwise
+  mutate(launch_year = year(launched)) %>% #We aren't interested in datetime in our case, just the year of the project
+  mutate(launched = date(launched)) #We are only interested in the date, as datetime is too detailed for our uses
+```
+
+We continue with removing redundant information. We will use only the usd_pledged_real variable for the pledged amount, discarding variables 'pledged' and 'usd pledged'. We will use usd_pledged_real as it is already converted to USD, allowing us to directly compare projects with different currencies. Next, we remove goal, as we will use usd_goal_real for the same reasons as above. We also remove the state variable, as the state is now encoded in our binary variable.
+
+We also aggregate the project success rate by main category and store the information in the variable bi_cat for later analysis.
+
+```{r, class.source = "fold-hide"}
+kickstarter_clean <- kickstarter_clean %>%
+  select(- c(pledged, state, `usd pledged`, goal, currency)) %>% #We remove redundant variables
+  group_by(main_category) %>%
+  mutate(bi_cat = mean(as.numeric(state_bi) - 1)) %>% #We calculate project success rates by main category
+  ungroup()
+```
+
+
+## EXPLORATORY DATA ANALYSIS
+
+To get a general overview, we check how many projects listed on Kickstarter were successfully funded.
+```{r, class.source = "fold-hide"}
+count(kickstarter_clean, Funding = factor(state_bi, labels = c("Unsuccessful", "Successful")), name = "Total projects") # We can see that a bit more than a third of all projects were successful.
+```
+We can see that around a third of all listed projects successfully secured funding. This seems like a surprisingly high number!
+
+As an interesting side-note, we check to see the most successful projects (1M USD raised +) and how many projects with a goal of a million $ + were successful:
+```{r}
+nrow(kickstarter_data[kickstarter_data$usd_goal_real > 1000000, ]) #Number of projects with a funding goal of 1M+ USD
+nrow(kickstarter_data[kickstarter_data$usd_goal_real > 1000000, ]) / nrow(kickstarter_data)# Relative proportion of 1M+ projects
+nrow(kickstarter_data[kickstarter_data$usd_goal_real > 1000000 & kickstarter_data$state == "successful", ]) / nrow(kickstarter_data[kickstarter_data$usd_goal_real > 1000000, ]) #Proportion of 1M + projects that were successful
+```
+We see that approximately 0.3% of all projects submitted to Kickstarter had a goal of over 1M USD (1085 projects in total). Out of those 0.3%, approximately 1% were successful. The 11 successful projects were the following:
+```{r, class.source = "fold-hide"}
+kickstarter_data[kickstarter_data$usd_goal_real > 1000000 & kickstarter_data$state == "successful", ]$name
+```
+
+
+### _Comparison between the years_
+
+We begin by taking a look at how the platform performed during the years 2009 and 2017. We will examine the number of projects launched, the overall project success rate, and the total amount of money invested on the platform.
+```{r, warning=FALSE, fig.height=13, fig.width=13, class.source = "fold-hide"}
+
+p7 <- kickstarter_clean %>%
+        group_by(launch_year) %>%
+        summarise(st_proj = n()) %>%
+        ggplot(aes(x = launch_year, y = st_proj)) +
+          geom_bar(stat = "identity", fill = "#14505C") +
+          scale_x_continuous(breaks = seq(2009, 2017, 1)) +
+          coord_cartesian(ylim = c(0, 90000)) +
+          ylab("Number of Projects") +
+          xlab("Launch Year") +
+          ggtitle("Number of Projects Launched Between 2009 and 2017") +
+          theme_fistro() +
+          theme(axis.text.x = element_text(angle = 45, size = 12, vjust = 1, hjust = 0.8),
+            axis.title.y = element_text(vjust = 3),
+            panel.grid.major.y = element_line())
+    
+
+
+#Proportion of successful projects by year
+
+p8 <- kickstarter_clean %>%
+        group_by(launch_year) %>%
+        summarise(succ_rate = (mean(as.numeric(state_bi) - 1)) * 100)  %>%
+        ungroup() %>%
+        ggplot(aes(x = launch_year, y = succ_rate)) +
+        geom_bar(stat = "identity", fill = "#14505C") +
+        scale_x_continuous(breaks = seq(2009, 2017, 1)) +
+        scale_y_continuous(breaks = c(0, seq(10, 50, 10))) +
+        coord_cartesian(ylim = c(0, 55)) +
+        ylab("Project Success rate in %") +
+        xlab("Launch Year") +
+        ggtitle("Overall Project Success Rate between 2009 and 2017") +
+        theme_fistro() +
+        theme(axis.text.x = element_text(angle = 45, size = 12, vjust = 1, hjust = 0.8),
+          axis.title.y = element_text(vjust = 3),
+          panel.grid.major.y = element_line())
+
+#Total ammount of $ invested in all projects on kickstarter per year
+
+p9 <- kickstarter_clean %>%
+        group_by(launch_year) %>%
+        summarise(inv = sum(usd_pledged_real) / 1000000) %>% #Transform to millions of $ scale
+        ungroup() %>%
+        ggplot(aes(x = launch_year, y = inv)) +
+        geom_bar(stat = "identity", fill = "#14505C") +
+        scale_x_continuous(breaks = seq(2009, 2017, 1)) +
+        coord_cartesian(ylim = c(0, 750)) +
+        xlab("Lauch year") +
+        ylab("Money invested (in million $)") +
+        ggtitle("Total Amount of Money Invested in Projects \n on Kickstarter between 2009 and 2017") +
+        theme_fistro() +
+          theme(axis.text.x = element_text(angle = 45, size = 12, vjust = 1, hjust = 0.8),
+          axis.title.y = element_text(vjust = 3),
+          panel.grid.major.y = element_line())
+
+p7 / p8 / p9
+```
+Upon examination, we see that Kickstarter was gaining popularity, which, it seems, peaked in 2015. The number of projects and the total amount of money invested began to fall after 2015, with the number of projects falling harder than the amount of money invested.
+
+We also see an interesting inverse phenomenon when looking at the graph of overall success rate. There we can see the overall success rate begin to fall and hit the bottom at below 30% in 2015 when there were the most projects on the platform. In the years after 2015, the success rate again began to approach values close to 40%. 
+
+This seems to suggest that the quality of the projects fell at the height of Kickstarter's popularity in 2015. Later, it appears to have gradually started to get better.
+
+We continue our data analysis by comparing the difference between categories on Kickstarter. We will compare the categories by project funding success rate, the number of backers that contributed to each category, the total amount of USD pledged, and the total number of projects launched by categories.
+
+```{r, warning=FALSE, fig.height=8, fig.width=13, class.source = "fold-hide"}
+#Project success rate by categories
+p1 <-kickstarter_clean %>%
+      group_by(main_category) %>%
+      summarise(success_per = mean(as.numeric(state_bi) - 1)) %>% #We summarise mean success rate by category to be visualised
+      arrange(desc(success_per)) %>%
+      ungroup() %>%
+      ggplot(aes(x = reorder(main_category, - success_per), y = success_per)) +
+      geom_col(fill = "#14505C") +
+      ggtitle("Project Success Rate by Main Categories") +
+      xlab(element_blank()) +
+      ylab("Project Success Rate") +
+      scale_y_continuous(labels = scales::percent, breaks = c(0.2, 0.4, 0.6)) +
+      theme_fistro() +
+      theme(axis.text.x = element_text(angle = 60, size = 10, vjust = 1, hjust = 1),
+        axis.title.y = element_text(vjust = 3),
+        panel.grid.major.y = element_line(),
+        plot.title = element_text(hjust = 1, vjust = 1.5))
+  
+
+
+#Which Categories have the Highest number of Backers
+
+p2 <-kickstarter_clean %>%
+      group_by(main_category) %>%
+      summarise(n_backers = sum(backers)/1000000) %>% #We divide the number of Backers by a million for clarity
+      ungroup() %>%
+      ggplot(aes(x = reorder(main_category, - n_backers), y = n_backers)) + 
+      geom_col(fill = "#14505C") +
+      scale_y_continuous(expand = c(0, 0), limits = c(0, NA), breaks = c(0.2, 1, 3, 5, 7, 11)) +
+      ggtitle("Number of Backers per category") +
+      theme_fistro()+
+      ylab("Total number of Backers in Millions") +
+      xlab(element_blank()) +
+      theme(axis.text.x = element_text(angle = 60, size = 10, vjust = 1, hjust = 1),
+          axis.title.y = element_text(vjust = 3),
+          panel.grid.major.y = element_line(),
+          plot.title = element_text(hjust = 1, vjust = 1.5))
+
+
+
+#Which categories attracted the most funding in total
+
+p3 <- kickstarter_clean %>%
+        group_by(main_category) %>%
+        summarise(total_pledged = sum(usd_pledged_real)/1000000) %>% #We divide by a million to get better readability
+        ungroup() %>%
+        ggplot(aes(x = reorder(main_category, - total_pledged), y = total_pledged)) +
+        geom_bar(stat = "identity", fill = "#14505C") +
+        scale_y_continuous(breaks = c(0, 50, 100, 200, 400, 600)) +
+        xlab(element_blank()) +
+        ylab("Ammount pledged in Million $") +
+        ggtitle("Total Amount of $ pledged by Category") +
+        theme_fistro() +
+        theme(axis.text.x = element_text(angle = 60, size = 10, vjust = 1, hjust = 0.8),
+          axis.title.y = element_text(vjust = 3),
+          panel.grid.major.y = element_line())
+
+
+#Which Categories had the most of projects
+
+p4 <- kickstarter_clean %>%
+        group_by(main_category) %>%
+        summarise(n_proj = n()/1000) %>% #We transform to number of projects in thousands
+        ggplot(aes(x = reorder(main_category, -n_proj), y = n_proj)) +
+        geom_bar(stat = "identity", fill = "#14505C") +
+        scale_y_continuous(breaks = c(0, 10, 20, 30, 40, 50, 60)) +
+        xlab(element_blank()) +
+        ylab("Number of Projects (in thousands)") +
+        ggtitle("Total Number of Projects Launched by Category") +
+        theme_fistro() +
+        theme(axis.text.x = element_text(angle = 60, size = 10, vjust = 1, hjust = 0.8),
+          axis.title.y = element_text(vjust = 3),
+          panel.grid.major.y = element_line())
+
+p1 + p4 + p3 + p2
+```
+When comparing different categories, we discovered some interesting findings. The most successful categories in terms of project success rate were dance, theater and comics, which all had success rates above 50%. At the same time, these categories were among the ones with the lowest number of launched projects, had the smallest number of total backers, and raised the lowest total amount of USD.
+
+In terms of backers and total amount of USD raised, the category games came out on top. Additionally, it launched a considerable number of projects while ranking average in terms of project success rate. This suggests that Kickstarter is a very viable platform for funding games, as it attracts a lot of capital and backers.
+
+A similar situation can be seen in the category of design, which attracts a similar amount of funds despite having significantly lower numbers of backers. It also has a nearly identical success rate.
+
+An interesting observation is the category of technology. It ranks third in terms of total amount of USD raised and number of backers. While still having an above average number of projects launched, it comes in last in project success rate, with an approximately 20% success rate. This suggests that the competition is very strong, but it appears possible to raise a considerate amount of funding with a good concept.
+
+The least popular categories seem to be crafts, journalism and dance with the least number of projects launched and the least amount of USD raised. Surprisingly, dance is the only category to have a project success rate above 60%, while journalism and crafts are among the categories with the worst project success rates. This suggests that Kickstarter is probably not the best crowdfunding site for crafts and journalism projects. At the same time, it appears to have a small but strong community for support on dance projects, which makes it a great crowdfunding site for such projects.
+
+
+
+Next, we take a closer look at the distributions of funding goals and the amount of USD raised per project between categories.
+```{r, warning=FALSE, fig.height=8, fig.width=13, class.source = "fold-hide"}
+p5 <- kickstarter_clean %>%
+        ggplot(aes(x = main_category, y = usd_goal_real, fill = bi_cat * 100)) + #We transform the fill to %
+          geom_boxplot(outlier.shape = NA) +
+          coord_cartesian(ylim = c(0, 120000)) +
+          scale_fill_paletteer_c("grDevices::BluGrn", direction = -1) +
+          xlab(element_blank()) +
+          ylab("Project funding goal ($)") +
+          ggtitle("Funding Goal Distribution by Categories") +
+          labs(fill = "Project Success \n      Rate in %") +
+          theme_fistro() +
+          theme(axis.text.x = element_text(angle = 60, size = 10, vjust = 1, hjust = 0.8),
+            axis.title.y = element_text(vjust = 3),
+            panel.grid.major.y = element_line())
+#Interestingly Food has high goals
+
+
+#Comparison of the ammount of $ invested per project between categories
+
+p6 <- kickstarter_clean %>%
+        ggplot(aes(x = main_category, y = usd_pledged_real, fill = bi_cat * 100)) +
+        geom_boxplot(outlier.shape = NA) +
+        coord_cartesian(ylim = c(0, 35000)) +
+        scale_fill_paletteer_c("grDevices::BluGrn", direction = -1) +
+        xlab(element_blank()) +
+        ylab("Money Invested in $") +
+        ggtitle("Amount of $ Invested in a Project by Categories") +
+        labs(fill = "Project Success \n      Rate in %") +
+        theme_fistro() +
+          theme(axis.text.x = element_text(angle = 60, size = 10, vjust = 1, hjust = 0.8),
+            axis.title.y = element_text(vjust = 3),
+            panel.grid.major.y = element_line())
+
+p5 / p6
+```
+In terms of funding goals, we see technology having the highest funding goals among the categories. At the same time, we see that it has a low project success rate, and checking the distribution of the amount of USD invested, we see it performing pretty mediocrely. 
+
+Several categories have relatively low funding goals but mixed success. theater, dance, and comics seem to be successful with their relatively low average funding goals, while crafts, photography and publishing less so.
+
+When comparing the distributions of funds raised across categories, design and games stand out as having the greatest number of projects that received funding that was above average. They both also retained an average success rate. We again see journalism and crafts struggling with a low success rate and a low amount of raised funds per project.
+
+Finally, we compare the number of projects by country of origin.
+```{r, warning=FALSE, class.source = "fold-hide", fig.height=10, fig.width=13}
+kickstarter_clean %>%
+  group_by(country) %>%
+  summarise(n_projects = n()) %>%
+  ggplot(aes(x = reorder(country, -n_projects), y = n_projects)) +
+  geom_bar(stat = "identity", fill = "#14505C") +
+        xlab(element_blank()) +
+        ylab("Number of Projects") +
+        ggtitle("Total Number of Projects Launched by Country") +
+        theme_fistro() +
+        theme(axis.text.x = element_text(angle = 60, size = 10, vjust = 2, hjust = 2.2),
+          axis.title.y = element_text(vjust = 3),
+          panel.grid.major.y = element_line())
+
+```
+
+
+We can see that the US absolutely dominates the number of projects. Rather than applying a transformation, I decided to keep the scale intuitive and rather filter out the projects launched in the US.
+
+```{r, warning=FALSE, class.source = "fold-hide", fig.height=10, fig.width=13}
+kickstarter_clean %>%
+  filter(country != "US") %>%
+  group_by(country) %>%
+  summarise(n_projects = n()) %>%
+  ggplot(aes(x = reorder(country, - n_projects), y = n_projects)) +
+  geom_bar(stat = "identity", fill = "#14505C") +
+        xlab(element_blank()) +
+        ylab("Number of Projects") +
+        ggtitle("Total Number of Projects Launched \n by Country without the US") +
+        theme_fistro() +
+        theme(axis.text.x = element_text(angle = 60, size = 10, vjust = 2, hjust = 2.5),
+          axis.title.y = element_text(vjust = 3),
+          panel.grid.major.y = element_line())
+
+```
+
+
+After filtering out the projects from the US, we can see that the data is still highly skewed because of the prevalence of the projects from Great Britain and, to a lesser extent, from Canada. Therefore, we will focus on data from European countries next, excluding Great Britain, for our analysis.
+
+```{r}
+kickstarter_eu <- kickstarter_clean %>%
+  filter(country %in% c("DE", "FR", "NL", "IT", "ES", "SE", "DK", "IE", "CH", "NO", "BE", "AT", "LU"))
+```
+
+We compare the number of projects launched and the average project success in the EU countries.
+```{r, warning=FALSE, fig.height=13, fig.width=13, class.source = "fold-hide"}
+p10 <- kickstarter_eu %>%
+  group_by(country) %>%
+  summarise(n_projects = n()) %>%
+  ggplot(aes(x = reorder(country, -n_projects), y = n_projects)) +
+  geom_bar(stat = "identity", fill = "#14505C") +
+        xlab(element_blank()) +
+        ylab("Number of Projects") +
+        ggtitle("Number of Projects Launched \n by Country in the EU") +
+        theme_fistro() +
+        theme(axis.text.x = element_text(angle = 60, size = 10, vjust = 2, hjust = 2.5),
+          axis.title.y = element_text(vjust = 3),
+          panel.grid.major.y = element_line())
+
+p11 <- kickstarter_eu %>%
+  group_by(country) %>%
+  summarise(project_succes = mean(as.numeric(state_bi)-1)) %>%
+  ggplot(aes(x = reorder(country, -project_succes), y = project_succes)) +
+  geom_bar(stat = "identity", fill = "#14505C") +
+        xlab(element_blank()) +
+        ylab("Project Success in %") +
+        ggtitle("Average Project Success \n by Country in the EU") +
+        theme_fistro() +
+        theme(axis.text.x = element_text(angle = 60, size = 10, vjust = 2, hjust = 2.5),
+          axis.title.y = element_text(vjust = 3),
+          panel.grid.major.y = element_line())
+
+p10 / p11
+```
+The results show that the most projects were launched in Germany, France, the Netherlands, and Italy. All of the countries had a low number of projects launched, however, ranging from just above 4000 in Germany all the way to around 600 in Austria if we remove Luxembourg as an outlier.
+
+In addition to the disappointing figures regarding the number of projects launched, we can also observe that the average project success figures show a similar picture, with most countries' average project success rate below 30%.
+
+To investigate whether there are some differences between the categories, we plot these as well as construct a table grouped by countries and categories to identify possible overachievers.
+
+```{r, warning=FALSE, class.source = "fold-hide", message=FALSE, fig.height=10, fig.width=13}
+kickstarter_eu %>%
+  group_by(main_category) %>%
+  summarise(project_succes = mean(as.numeric(state_bi)-1)) %>%
+  ggplot(aes(x = reorder(main_category, -project_succes), y = project_succes)) +
+  geom_bar(stat = "identity", fill = "#14505C") +
+        xlab(element_blank()) +
+        ylab("Project Success in %") +
+        ggtitle("Average Project Success \n by Category in the EU Countries") +
+        theme_fistro() +
+        theme(axis.text.x = element_text(angle = 60, size = 10, vjust = 0.9, hjust = 0.9),
+          axis.title.y = element_text(vjust = 3),
+          panel.grid.major.y = element_line())
+
+kickstarter_eu %>%
+  group_by(country, main_category) %>%
+  summarise(success = mean(as.numeric(state_bi) - 1), n_proj = n()) %>%
+  filter(n_proj > 10) %>%
+  arrange(desc(success)) %>%
+  head(20)
+  
+```
+Looking at the project success rates, we see a very similar picture in the EU countries as in the overall dataset, with comics, theater, and music being the most successful categories.
+
+We have filtered our table for results with at least 10 projects and, examining it, we can see that, in addition to the best performing categories being generally the most successful ones, we see mostly countries from Northern Europe in the results with the highest success.
+
+We can conclude that Kickstarter was much less popular in Europe than in the US between 2009 and 2017. The trends seem to be similar, however, and especially in Northern Europe, there seems to be a large enough community forming to offer reasonable prospects of funding projects, especially in the most popular categories.
+
+
+## SENTIMENT ANALYSIS - AFINN AND BING
+### _BING Lexicon_
+
+As a part of our analysis, we will calculate the sentiment values of the project's names. We will then try to determine whether the overall sentiment of the project's name has any effect on the project's success. We will try out two different lexicons (BING and AFINN). 
+
+We begin by preparing data for analysis with the BING lexicon and extracting the sentiment value of the project's names. Then we join the data with our existing dataset.
+```{r}
+#Sentiment analysis - does the sentiment value of the name of the project affect it's success - BINARY BING LEXICON
+
+kickstarter_bing <- kickstarter_clean %>%
+  unnest_tokens(word, name) %>%
+  inner_join(get_sentiments("bing"), by = "word") #Preparing data for analysis
+
+kickstarter_bing <- kickstarter_bing %>% 
+  count(ID, sentiment) %>% #We split by ID and sentiment (on longer titles that have more relevant words)
+  spread(sentiment, n) %>% #Spread the sentiment values to two columns (neg, pos)
+  replace_na(list(negative = 0, positive = 0)) %>% #Replacing the resulting NAs
+  mutate(ovrl_sen = positive - negative) %>% #Calculating the overall sentiment for every ID
+  select(ID, ovrl_sen)
+
+
+clean_bing <- left_join(kickstarter_clean, kickstarter_bing, by = "ID") #Joining the sentiment values to the original data
+```
+After we've joined the sentiment values to our original dataset, we look for any resulting NAs from projects with no sentiment-containing words in their names.
+```{r, collapse=TRUE}
+head(clean_bing$ovrl_sen, 10) #It seems that a lot of entries didn't get a sentiment value assigned
+sum(is.na(clean_bing$ovrl_sen)) 
+```
+We can see that there were a lot of resulting NAs from project names lacking words with sentimental value. I decided to replace the NAs with a sentiment value of 0.
+```{r, collapse=TRUE}
+clean_bing <- clean_bing %>% 
+  replace_na(list(ovrl_sen = 0)) #We replace the NA values with 0
+
+sum(is.na(clean_bing$ovrl_sen)) #We see there are no more NA values
+```
+We take a look at the distribution of sentiment values.
+```{r, class.source = "fold-hide"}
+table(clean_bing$ovrl_sen)
+```
+Taking a look at the distribution of the sentiment values, we see that the most extreme ones were -5 and 5. However, there were very few projects with these values. As a result, we remove the projects that have these values and continue our analysis.
+```{r, class.source = "fold-hide"}
+clean_bing <- clean_bing %>%
+  filter(ovrl_sen > -5 & ovrl_sen < 5) #We filter for projects with sentiment values between -5 and 5, because there is only 1 project with a value of -5 and 8 projects with a value of 5
+```
+Next, we visualize the relationships between the sentiment, project success rate, and the average amount raised per project.
+```{r, warning=FALSE, fig.height=8, fig.width=13, class.source = "fold-hide"}
+clean_bing %>%
+  group_by(ovrl_sen) %>%
+  summarise(per = mean(as.numeric(state_bi) - 1), avg_fund = sum(usd_pledged_real / n()), nproj = n()) %>% #we calculate the average success rate of projects and the average amount raised per project for every category
+  ungroup() %>%
+  ggplot(aes(x = ovrl_sen, y = per, fill = avg_fund)) + #We plot the proportion of successful projects and average amount of $ funded per project by categories
+    geom_col(position = "dodge2", alpha = 0.8) +
+    geom_text(aes(label = paste0("* ", nproj), vjust = - 0.8)) +
+    scale_y_continuous(labels = scales::label_percent(accuracy = 1)) +
+    scale_x_continuous(breaks = seq(-5, 5, by = 1)) +
+    labs(title = "Proportion of Successful projects \n and Average Ammount of Money spent \n by BING Sentiment \n",
+         x = "Overall BING Sentiment",
+         y = "Proportion of Successful Projects in %",
+         fill = "Average $ \n per project") +
+    scale_fill_paletteer_c("grDevices::BluGrn", direction = -1) +
+    geom_text(x = 2, y = 0.41, label = "* Number of projects", color = "#14505C") +
+    theme_fistro() +
+    theme(plot.title = element_text(vjust = 1),
+          panel.grid.major.y = element_line(),
+          axis.text.x = element_text(vjust = 5)) 
+
+```
+Taking a look at our image, there might be a slight trend of projects with negative sentiment being overall more successful, but on average they raise less funding. The projects that have a more positive overall sentiment appear to raise more money but are less successful overall.
+
+Next, we try a very basic and limited generalized linear model to test the idea of whether the sentiment value of a project’s name might affect its funding success.
+```{r, message=FALSE, collapse=TRUE}
+summary(glm(state_bi ~ ovrl_sen, data = clean_bing, family = "binomial")) #We try a simple logistic model
+exp(confint(glm(state_bi ~ ovrl_sen, data = clean_bing, family = "binomial"))) #The simple model predicts an 8-10% reduction in project success with rising values of overall sentiment
+```
+The simple model estimates that overall sentiment significantly affects the overall success rate of a project. With the rising value of the overall sentiment, it predicts a 8% to 10% decrease in project success.
+
+This gives us some confirmation that the sentiment of a project's name might affect its success. However, for now, we must keep in mind that we used this for illustrative purposes and that the model as such is too simple to build our analysis on it.
+
+
+### _AFINN Lexicon_
+
+We use the same data preparation process, this time with the AFINN lexicon. 
+```{r}
+#Sentiment analysis - does the sentiment value of the name of the project affect it's success - AFINN LEXICON
+
+kickstarter_afinn <- kickstarter_clean %>%
+  unnest_tokens(word, name) %>%
+  inner_join(get_sentiments("afinn"), by = "word") #We prepare the data for analysis with an AFINN lexicon
+
+
+#We calculate the sentiment value for every project
+kickstarter_afinn <- kickstarter_afinn %>% 
+  group_by(ID) %>%
+  mutate(ovrl_sen = sum(value)) %>% #We calculate the overall sentiment value of a projects with longer names by adding the sentiment scores of the included words together
+  select(ID, ovrl_sen)
+```
+For a quick sanity check, we isolate the projects with the most sentiment-containing words and take a look at an example.
+```{r, n.cols = 2, class.source = "fold-hide"}
+count(kickstarter_afinn, ID) %>% arrange(desc(n)) %>% head(20) #We take a quick look at the titles containing the most sentiment defined words.
+```
+
+```{r, n.cols = 2, collapse=TRUE}
+filter(kickstarter_afinn, ID == 1219933968) #We take a look at one of the projects
+filter(kickstarter_clean, ID == 1219933968)$name 
+```
+We see that, for example, the project with ID 1219933968 had 6 such words with an overall sentiment value of -2.
+
+Next, we join the sentiment values with the original dataset and take a glimpse of the distribution of overall sentiment values in our dataset.
+```{r, collapse=TRUE}
+clean_afinn <- left_join(kickstarter_clean, unique(kickstarter_afinn), by = "ID") #We join the AFINN sentiment values with the original dataset, using only unique values to avoid duplication
+table(clean_afinn$ovrl_sen) #A brief overview of the range of our calculated sentiment values
+sum(is.na(clean_afinn$ovrl_sen))
+```
+Firstly, as before, we see a lot of resulting NAs from the projects that have no sentiment-containing words in their names. Otherwise, we see sentiment ranging from -12 to 14. As expected, there are few projects on the extreme edges.
+
+We decide to replace the NAs with 0, as with the BING lexicon. The sentiment classes with 20 or more observations were retained. We produce the same type of plot as before, this time divided by the AFINN lexicon sentiment values.
+```{r}
+clean_afinn <- clean_afinn %>% 
+  replace_na(list(ovrl_sen = 0)) #We replace the NA values with 0
+
+sum(is.na(clean_afinn$ovrl_sen)) #We see there are no more NA values
+```
+
+```{r, warning=FALSE, fig.height=8, fig.width=13, class.source = "fold-hide"}
+clean_afinn %>%
+  group_by(ovrl_sen) %>%
+  summarise(per = mean(as.numeric(state_bi) - 1), cash = sum(usd_pledged_real / n()), nproj = n()) %>%
+  filter(between(ovrl_sen, -8, 10)) %>% #We filter out instances of sentiment values that have fewer than 20 samples
+  ungroup() %>%
+  ggplot(aes(x = ovrl_sen, y = per, fill = cash)) +
+  geom_col(position = "dodge2", width = 1, alpha = 0.8) +
+  geom_text(aes(label = paste0("*", nproj), vjust = - 1), size = 2.2) +
+  scale_y_continuous(labels = scales::percent, breaks = c(0, 0.1, 0.2, 0.3, 0.35)) +
+  scale_x_continuous(breaks = seq(-8, 10, by = 1)) +
+  scale_fill_paletteer_c("grDevices::BluGrn", direction = -1) +
+  geom_text(x = 8, y = 0.37, label = "* Number of Projects", size = 3, color = "#14505C") +
+  theme_fistro() +
+  labs(title = "Rate of Funding by AFINN Sentiment Value",
+       x = "AFINN Sentiment Value",
+       y = "Proportion of Successfuly Funded Projects (%)",
+       fill = "Average Ammount \n of $ per Project",) +
+  theme(plot.title = element_text(vjust = 1.4),
+        panel.grid.major.y = element_line(),
+        axis.text.x = element_text(vjust = 8))
+#Any effects are much less pronounced
+
+```
+We can see from the graph that any effect of overall sentiment is much less prominent in the AFINN classification and there is no real observable pattern. To get a better idea, we run a very basic GLM model again, predicting project success based on overall sentiment.
+
+```{r, collapse=TRUE}
+summary(glm(state_bi ~ ovrl_sen, data = clean_afinn, family = "binomial")) #Very simple model
+exp(confint(glm(state_bi ~ ovrl_sen, data = clean_afinn, family = "binomial"))) #This time the effect seems to be significantly lower (perhaps because of more bins in case of AFINN) and represents an decrease of about ~ 1 do 2%
+```
+The sentiment values obtained using the AFINN lexicon still result in a significant effect on the project success rate in our simple model. The magnitude of the effect is much lower now, however, with the overall sentiment value increase accounting for a 1% to 2.5% decrease in project success rate.
+
+As an interesting side note, we take a look at the projects with the most extreme (positive and negative) sentiment values calculated with the BING lexicon.
+```{r, class.source = "fold-hide"}
+#Extreme sentiment value examples
+clean_bing %>%
+  filter(ovrl_sen <= -4) %>% #We filter for the entries with the lowest sentiment scores from BING Lexicon analysis
+  select(name, ovrl_sen) %>% 
+  arrange(ovrl_sen) %>%
+  head(20)
+
+clean_bing %>%
+  filter(ovrl_sen >= 4) %>% #We filter for the entries with the highest sentiment scores from BING Lexicon analysis
+  select(name, ovrl_sen) %>%
+  arrange(desc(ovrl_sen)) %>%
+  head(20)
+```
+
+We do the same for the values obtained by the AFINN lexicon analysis.
+```{r, class.source = "fold-hide"}
+
+clean_afinn %>%
+  filter(ovrl_sen < -8) %>% #We filter for the entries with the lowest sentiment scores from AFINN Lexicon analysis
+  select(name, ovrl_sen) %>%
+  arrange(ovrl_sen) %>%
+  head(20)
+
+clean_afinn %>%
+  filter(ovrl_sen > 11) %>% #We filter for the entries with the highest sentiment scores from AFINN Lexicon analysis
+  select(name, ovrl_sen) %>%
+  arrange(desc(ovrl_sen)) %>%
+  head(20)
+```
+
+
+### Wordcloud
+
+
+To get an idea of the common words in project names, we construct a wordcloud. We remove some very common words that describe the category of the projects.
+```{r, warning=FALSE, class.source = "fold-hide"}
+#Wordclouds
+set.seed(2001)
+
+text <- kickstarter_data$name
+kickstarter_corpus <- Corpus(VectorSource(text[sample(length(text), 1000)])) #We downsample the Corpus so that we get a reasonable output
+
+clean_corpus <- kickstarter_corpus %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removePunctuation) %>% #We do the standard cleaning procedure, removing numbers, punctuation and whitespace
+  tm_map(stripWhitespace)
+
+clean_corpus <- tm_map(clean_corpus, content_transformer(tolower))
+clean_corpus <- tm_map(clean_corpus, removeWords, c(stopwords("english"), "canceled", "film", "book", "project", "game", "new", "music", "art", "album", "novel", "video", "story", "documentary", "magazine", "movie", "dance")) #We remove the stopwords and words describing Kickstarter categories
+
+dtm <- TermDocumentMatrix(clean_corpus) #Transforming the data to a document matrix form
+dtm_matrix <- as.matrix(dtm)
+words <- sort(rowSums(dtm_matrix), decreasing = T)
+wordcloud_data <- data.frame(word = names(words), freq = words)
+
+gbl_palette <- paletteer_c("grDevices::BluGrn", n = 50) #We use the custom palette we used before
+gbl_palette2 <- c(gbl_palette, rep(gbl_palette[50], 350)) #We edit the palette so that we still get the color differentiation but recycle the lightest colour for the words with the lowest occurences
+wordcloud2(data = wordcloud_data, color = gbl_palette2)
+#We see mostly words such as first, world, life, help, mostly positive words
+```
+
+Inspecting our wordcloud, we see a strong emphasis on first and debut, suggesting that the users are proposing supposedly innovative products or services. We also notice some other common words, such as short, love, world, and help. In general, positive words seem to be much more prevalent.
+
+
+### Preparing the data for modeling
+
+There is a choice to be made, whether to keep the sentiment values calculated by BING or AFINN. BING showed a stronger effect overall in our simple model, but there is some accuracy that is lost compared to the AFINN lexicon. The BING lexicon ranks words as good or bad, assigning them a +1 or -1 value. The AFINN lexicon, on the other hand, assigns them scores based on the magnitude of the sentiment, thus resulting in more detailed scores. In this case, I ultimately decided to go with AFINN.
+
+We also add another variable to our dataset: duration. We calculate the project's duration as the difference between the project’s deadline and the date it was launched.
+```{r}
+clean_afinn <- clean_afinn %>%
+  mutate(duration = as.numeric(deadline - launched)) #We calculate the duration of the project
+```
+
+We split our data in a 60/40 split between training and test data.
+```{r}
+set.seed(2002)
+
+split_rows <- sample(nrow(clean_afinn), round(nrow(clean_afinn) * 0.6)) #We make an index for a 60/40 data split
+train_data <- clean_afinn[split_rows, ] #We create a training dataset
+test_data <- clean_afinn[-split_rows, ] #We create a testing dataset
+```
+
+We check for unbalanced classes in our data.
+```{r}
+table(train_data$state_bi) #Once again, we see that the data on the training set is quite unbalanced
+sum(train_data$state_bi == 0) / nrow(train_data) #Class 0 represents 64% of cases
+```
+
+As we can see, our data is unbalanced. Class 0 represents 64% of our cases, so we will use oversampling to balance it. However, keeping in mind that balancing the data might not result in better models as discussed in prof. Frank Harell's [blogpost](https://www.fharrell.com/post/classification/), I decided to perform the analyses on the original, unbalanced dataset as well and compare the end results.
+```{r}
+over_spl <- ovun.sample(state_bi ~ ., data = train_data, method = "over") #We oversample the dataset
+table(over_spl$data$state_bi) #We see that the classes are now balanced 
+over_data <- over_spl$data #We assign our data to a new dataset to use later
+```
+
+Also note that for the purpose of modelling, we have to remove some variables in our data.
+
+We remove ID and name, as ID would represent noise and name doesn’t carry any computable information to model with, except sentiment, which we have saved in a new variable. We also remove the bi_cat variable, which was used for graphing purposes.
+
+We remove the main category variable because the category variable provides the same information in a higher resolution. However, we will have to use the main category variable when training a Random Forest model, as the 159 levels are too much for the algorithm to handle. In the rest of the models, we will use the category variable.
+
+Additionally, we remove the variables' deadline and launched. Deadline is deprecated, as we have calculated the project duration and so is launched, as we transformed it into a simpler category, launch_year.
+
+Lastly, we remove the data we don’t have when we submit a new project on the platform, such as the number of backers and the amount of USD pledged. This data also describes the project's success directly and accurately and would erroneously lead to highly accurate predictions if it was known to the model.
+
+```{r, class.source = "fold-hide"}
+set.seed(2003)
+
+clean_over <- over_data %>%
+  select(-c("ID", "name", "deadline", "backers", "usd_pledged_real", "bi_cat", "launched")) 
+
+clean_over <- clean_over[sample(nrow(clean_over)), ] #We shuffle the data, because they were split by state_bi variable from ovun.sample
+
+clean_over2 <- clean_over %>%
+  select(-category)
+
+clean_over <- clean_over %>%
+  select(-main_category)
+
+clean_train <- train_data %>%
+   select(-c("ID", "name", "deadline", "backers", "usd_pledged_real", "bi_cat", "launched", "main_category"))
+
+clean_train2 <- train_data %>%
+  select(-c("ID", "name", "deadline", "backers", "usd_pledged_real", "bi_cat", "launched", "category"))
+
+clean_test <- test_data %>%
+ select(-c("ID", "name", "deadline", "backers", "usd_pledged_real", "bi_cat", "launched", "main_category"))
+
+clean_test2 <- test_data %>%
+  select(-c("ID", "name", "deadline", "backers", "usd_pledged_real", "bi_cat", "launched", "category"))
+
+```
+
+
+## MODELLING
+ 
+We will compare our different models based on three criteria: AUC, log-loss, and Brier score. We will train them both on our balanced and original, unbalanced dataset and compare the differences. The models we will try are Logistic regression, Random Forest, Gradient Boosting, and XGBoost. For the log-loss calculations, we will use our defined function.
+
+We start by designing a naive model as a baseline to compare all the other models to. Since our original data is unbalanced 64/36 towards the 0 - negative class, we will design our model to predict a majority class for each input.
+
+```{r, warning=FALSE}
+naive_preds <- rep(0, nrow(test_data)) #We construct the binary 'predictions' in our naive model
+naive_preds_probs <- rep(sum(test_data$state_bi == 1) / nrow(test_data), nrow(test_data))
+#We construct the prediction probabilities for our naive model. We get the probability of a observation being assigned a class 1 from the class imbalance in our data. We then recycle that value to all predictions.
+
+LogLossBinary = function(actual, predicted, eps = 1e-15) {
+  predicted = pmin(pmax(predicted, eps), 1-eps)
+  - (sum(actual * log(predicted) + (1 - actual) * log(1 - predicted))) / length(actual)
+} #We define a log-loss function
+
+mean((naive_preds_probs - (as.numeric(test_data$state_bi) - 1))^2) #The naive model gives a Brier Score of 0.230
+auc(test_data$state_bi, naive_preds_probs) #It gives the AUC of 0.5
+LogLossBinary((as.numeric(test_data$state_bi) - 1), naive_preds_probs)#The log-loss of the naive model is 0.653
+```
+Evaluating our naive model, we get an AUC value of 0.5, a Brier Score of 0.230 and a log-loss value of 0.653.
+
+
+### Logistic Regression
+
+As for the first model, we fit a logistic regression to predict the success of a project. We begin by fitting it first on the balanced dataset, then on the original. We will inspect the two models, make predictions with them, and then finally compare the two against each other.
+```{r, warning=FALSE, message=FALSE}
+#Using the balanced dataset
+logi_mod <- glm(state_bi ~ ., data = clean_over, family = binomial) #We fit the logistic model on our balanced dataset
+summary(logi_mod) #We see a residual distribution skewed to the right
+```
+
+After training the model, we make predictions based on our test data and calculate the performance metric.
+```{r, message=FALSE, collapse=TRUE}
+logipreds_prob <- predict(logi_mod, newdata = clean_test, type = "response") #We predict the class probabilities on the test set
+logipreds <- ifelse(logipreds_prob > 0.5, 1, 0) #To transform our probabilities to class labels, we use the default 0.5 threshold
+
+auc(clean_test$state_bi, logipreds_prob) #We get an AUC value of 0.717
+mean((logipreds_prob - (as.numeric(clean_test$state_bi) - 1))^2) #We reach a Brier score of 0.216
+LogLossBinary((as.numeric(clean_test$state_bi) - 1), logipreds_prob) #We reach a log-loss score of 0.619
+
+table(predictions = logipreds, truth = clean_test$state_bi)
+```
+Taking a quick look at the summary of the GLM model, we see that many variables and levels have significant effects. We also notice an improvement across all of our metrics. The AUC improved greatly, going from 0.5 to 0.7168, along with improvements to the Brier score and log-loss.
+
+Next, we repeat the modelling phase on our original, unbalanced dataset.
+
+```{r, warning=FALSE, message=FALSE}
+### Using the unbalanced dataset
+
+logi_mod_ub <- glm(state_bi ~ ., data = clean_train, family = binomial) 
+summary(logi_mod_ub) #Compared to the balanced data, we can see an improvement in AIC
+```
+
+```{r, message=FALSE, collapse=TRUE}
+logipreds_prob_ub <- predict(logi_mod_ub, newdata = clean_test, type = "response")
+logipreds_ub <- ifelse(logipreds_prob_ub > 0.5, 1, 0)
+
+auc(clean_test$state_bi, logipreds_prob_ub) #We get an AUC value of 0.718
+mean((logipreds_prob_ub - (as.numeric(clean_test$state_bi) - 1))^2) #We reach a Brier score of 0.200
+LogLossBinary((as.numeric(clean_test$state_bi) - 1), logipreds_prob_ub) #Our calculated Log-loss is 0.584
+
+
+table(predictions = logipreds_ub, truth = clean_test$state_bi)
+```
+By comparing the two models, we get a better fit in every metric using the original, unbalanced data. Most notably, despite only a very modest change in AUC, we now see greater improvements in the Brier score and log-loss.
+
+### _Ridge regularization_
+
+In order to see if we can get a better fit, we perform logistic regression with Ridge regularization on the original data. First we have to transform the shape of the data. We have to one-hot encode the categorical variables and transform the data into a matrix so it can be used in the glmnet package.
+```{r, warning=FALSE, message=FALSE, class.source = "fold-hide"}
+train_mm_ub <- clean_train %>%
+  select(-c(state_bi, category, country)) #We remove any non numeric variables and the target variable
+
+train_mm_lab_ub <- clean_train$state_bi #Saving the labels
+categories_ub <- model.matrix(~category + country -1, clean_train) #One-hot encoding
+
+train_mm_num_ub <- cbind(train_mm_ub, categories_ub) #We combine the two datasets
+train_mm_mat_ub <- data.matrix(train_mm_num_ub) #And transform it into a matrix
+
+test_mm_data <- clean_test %>%
+  select(-c(state_bi, category, country)) #We do the same on the test data
+
+test_mm_data_lab <- clean_test$state_bi #Labels for the test set
+categories_test <- model.matrix(~category + country -1, clean_test)
+
+test_mm_num <- cbind(test_mm_data, categories_test) 
+test_mm_mat <- data.matrix(test_mm_num)
+```
+
+We perform the Ridge regularization using the glmnet package next.
+```{r, message=FALSE}
+set.seed(2005)
+reg_cv_ub <- cv.glmnet(train_mm_mat_ub, as.numeric(train_mm_lab_ub) - 1, alpha = 0) #Ridge
+```
+
+After training the model, we use it together with the optimal lambda value to create predictions on the test data.
+```{r, warning=FALSE, message=FALSE, collapse=TRUE}
+logipreds_prob_reg_ub <- predict(reg_cv_ub, newx = test_mm_mat, type = "response", s = reg_cv_ub$lambda.min)
+logipreds_reg_ub <- ifelse(logipreds_prob_reg_ub > 0.5, 1, 0)
+
+auc(clean_test$state_bi, logipreds_prob_reg_ub) #We get an AUC value of 0.695
+mean((logipreds_prob_reg_ub - (as.numeric(clean_test$state_bi) - 1))^2) #We reach a Brier score of 0.206
+LogLossBinary((as.numeric(clean_test$state_bi) - 1), logipreds_prob_reg_ub) #Our calculated Log-loss is 0.605
+
+
+table(predictions = logipreds_reg_ub, truth = clean_test$state_bi)
+```
+It seems that in our case, regularization does not lead to improved results, as it performed worse than the original model in all three metrics, returning an AUC value of 0.695, a Brier score of 0.206, and a log-loss of 0.605.
+
+### Random forest
+
+Next, we repeat the analysis using Random Forest. As the 159 levels of variable category are too much for Random Forest to handle, we will instead use the main category variable.
+```{r, message=FALSE, collapse=TRUE}
+######################################## Random Forest
+set.seed(2005)
+kick_rf_model <- randomForest(state_bi ~ ., data = clean_over2)
+
+print(kick_rf_model)
+importance(kick_rf_model) 
+```
+Measuring the importance of our variables, we see that the most influential are usd_goal_real, duration, and main_category.
+
+Next, we make predictions using our model and calculate the metrics.
+```{r, message=FALSE, collapse=TRUE}
+kick_rf_preds <- predict(kick_rf_model, newdata = clean_test2, type = "response") #Make class predictions
+kick_rf_preds_prob <- predict(kick_rf_model, newdata = clean_test2, type = "prob") #Make probability predictions
+
+auc(clean_test2$state_bi, kick_rf_preds_prob[, 2]) #We use the 2nd column of our probabilities prediction, because that is the column that gives the probability of the observation to be class 1
+mean((kick_rf_preds_prob[, 2] - (as.numeric(clean_test2$state_bi) - 1))^2)
+LogLossBinary((as.numeric(clean_test2$state_bi) - 1), kick_rf_preds_prob[, 2])
+```
+Looking at the results, they aren’t very encouraging. We get a solid AUC value of 0.697. The Brier score and log-loss are both worse than the baseline naive model.
+
+Next, we perform Random Forest on the unbalanced dataset
+```{r, message=FALSE, warning=FALSE, class.source = "fold-hide", collapse=TRUE}
+######################################## Random Forest
+set.seed(2005)
+kick_rf_model_ub <- randomForest(state_bi ~ ., data = clean_train2)
+
+print(kick_rf_model_ub)
+importance(kick_rf_model_ub) 
+```
+There isn't much difference in variable importance, but the model seems to have more trouble in predicting the successful class.
+
+Next, we make predictions and evaluate the model metrics.
+```{r, message=FALSE, collapse=TRUE}
+kick_rf_preds_ub <- predict(kick_rf_model_ub, newdata = clean_test2, type = "response") #Make class predictions
+kick_rf_preds_prob_ub <- predict(kick_rf_model_ub, newdata = clean_test2, type = "prob") #Make probability predictions
+
+auc(clean_test2$state_bi, kick_rf_preds_prob_ub[, 2]) #We use the 2nd column of our probabilities prediction, because that is the column that gives the probability of the observation to be class 1
+mean((kick_rf_preds_prob_ub[, 2] - (as.numeric(clean_test2$state_bi) - 1))^2)
+LogLossBinary((as.numeric(clean_test2$state_bi) - 1), kick_rf_preds_prob_ub[, 2])
+```
+The results that we get from random forest on the unbalanced dataset are even worse than the ones we got on the balanced dataset. Seeing that random forest performs poorly on our data, we turn to a stronger method using decision trees - GBM - next.
+
+
+### GBM - Gradient Boosting
+
+The next algorithm that we will try is gradient boosting. We begin by transforming the data, as gbm needs the response variable to be numeric.
+```{r, warning=FALSE, message=FALSE, class.source = "fold-hide"}
+##### GBM model
+over_data_gbm <- clean_over
+over_data_gbm$state_bi <- as.numeric(over_data_gbm$state_bi) - 1 #We transform the factor variable to numeric for the GBM algorithm
+```
+
+We first try training a model with more or less default values. We chose a higher number of trees (1500), lower shrinkage (0.01), and 2-way interactions.
+```{r, warning=FALSE, message=FALSE, collapse=TRUE}
+set.seed(2006)
+kick_gbm <- gbm(state_bi ~ ., data = over_data_gbm, distribution = "bernoulli", n.trees = 1500, shrinkage = 0.01, interaction.depth = 2, cv.folds = 5) #We train the model
+summary(kick_gbm) #We see that the three influential predictors are category, goal and the project duration
+```
+Based on the model, we can see that the three most important variables are category, usd_goal_real, and project duration. The results are slightly different than the ones we got from random forest, which valued the variable usd_goal_real as the most influential. As opposed to random forest, the gbm model also deems the ovrl_sen variable as one without importance.
+
+We continue by examining whether we have enough iterations.
+```{r, class.source = "fold-hide"}
+opt_tree <- gbm.perf(kick_gbm, method = "cv")
+```
+
+As we can see, we seem to be close to reaching a plateau with 1500 iterations, so we will use this value in our future modeling.
+
+Using our model, we create predictions based on the test data.
+```{r, message=FALSE, collapse=TRUE}
+gbm_preds_prob <- predict(kick_gbm, newdata = clean_test, type = "response", n.trees = 1500) #We predict on the test set
+gbm_preds <- ifelse(gbm_preds_prob > 0.5, 1, 0)
+
+
+auc(clean_test$state_bi, gbm_preds_prob) #The AUC from GBM is 0.742
+mean((gbm_preds_prob - (as.numeric(clean_test$state_bi) - 1))^2) #Brier Score of 0.207
+LogLossBinary((as.numeric(clean_test$state_bi) - 1), gbm_preds_prob) #Log-loss of 0.598
+```
+We see encouraging results, as GBM is outperforming logistic regression on the balanced dataset in every metric. Next, we fit the GBM model to the unbalanced dataset.
+
+```{r, message=FALSE, collapse=TRUE}
+#### Unbalanced dataset data preparation and fitting
+
+train_data_gbm_ub <- clean_train
+train_data_gbm_ub$state_bi <- as.numeric(train_data_gbm_ub$state_bi) - 1
+
+set.seed(2007)
+kick_gbm_ub <- gbm(state_bi ~ ., data = train_data_gbm_ub, distribution = "bernoulli", n.trees = 1500, shrinkage = 0.01, interaction.depth = 2, cv.folds = 5)
+summary(kick_gbm_ub)
+```
+Variable importance on our unbalanced dataset remains pretty much unaffected. We check if our number of iterations was sufficient.
+
+```{r, class.source = "fold-hide"}
+opt_tree2 <- gbm.perf(kick_gbm_ub, method = "cv")
+```
+
+Similarly to the balanced dataset, 1500 trees seem to be doing a good job of approaching the plateau.
+
+We continue by calculating predictions using the gbm model trained on the unbalanced dataset and assessing model performance.
+```{r, message=FALSE, collapse=TRUE}
+gbm_preds_ub_prob <- predict(kick_gbm_ub, newdata = clean_test, type = "response", n.trees = 1500)
+gbm_preds_ub <- ifelse(gbm_preds_ub_prob > 0.5, 1, 0)
+
+auc(clean_test$state_bi, gbm_preds_ub_prob) #The AUC is 0.741
+mean((gbm_preds_ub_prob - (as.numeric(clean_test$state_bi) - 1))^2) #Brier score - 0.193
+LogLossBinary((as.numeric(clean_test$state_bi) - 1), gbm_preds_ub_prob) #Log-loss of 0.565
+```
+Using the GBM on our unbalanced dataset yields our best performance so far, with an AUC of 0.741, Brier Score of 0.193, and log-loss of 0.565.
+
+### _Hyperparameter tuning of GBM_
+
+We tune the GBM hyperparameters using the caret package. Since iteration with many hyperparameter combinations is very computationally expensive and we are limited by our hardware, we are unfortunately forced to use a small subset of data to try to find the optimal parameters for our model.
+
+```{r, message=FALSE, warning=FALSE, results='hide'}
+set.seed(2007)
+sam_ub_gbm <- clean_train[sample(nrow(clean_train), 4000), ] #we construct a smaller sample
+
+levels(sam_ub_gbm$state_bi) <- c("Failed", "Successful")
+
+cacontrol <- trainControl(method = "repeatedcv",
+                          number = 10,
+                          repeats = 3,
+                          classProbs = T,
+                          summaryFunction = twoClassSummary)
+
+gbmGrid <- expand.grid(interaction.depth = c(2,4,6),
+                       n.trees = 1500,
+                       shrinkage = c(0.001, 0.005, 0.01, 0.015, 0.5, 0.1),
+                       n.minobsinnode = 10)
+
+
+clus <- makePSOCKcluster(8)
+registerDoParallel(clus)
+
+gbmtun <- train(state_bi ~ ., data = sam_ub_gbm,
+                method = "gbm",
+                trControl = cacontrol,
+                tuneGrid = gbmGrid,
+                metric = "ROC")
+
+stopCluster(clus)
+```
+
+```{r, message=FALSE, warning=FALSE}
+gbmtun
+ggplot(gbmtun)
+```
+
+Looking at the results, we can see that the best shrinkage values are around 0.01. We can also see that increasing the max tree depth in general leads to worse results after shrinkage reaches 0.01. The best value was, however, achieved with max tree depth = 4. Therefore, we will use these values in training our model. We will also bump the number of iterations to 2000.
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(2007)
+kick_gbm_ub_tun <- gbm(state_bi ~ ., data = train_data_gbm_ub, distribution = "bernoulli", n.trees = 2000, shrinkage = 0.01, interaction.depth = 4, cv.folds = 5)
+summary(kick_gbm_ub_tun)
+```
+
+```{r, message=FALSE, collapse=TRUE}
+gbm_preds_ub_tun_prob <- predict(kick_gbm_ub_tun, newdata = clean_test, type = "response", n.trees = 2000)
+gbm_preds_ub_tun <- ifelse(gbm_preds_ub_tun_prob > 0.5, 1, 0)
+
+auc(clean_test$state_bi, gbm_preds_ub_tun_prob) #The AUC is 0.748
+mean((gbm_preds_ub_tun_prob - (as.numeric(clean_test$state_bi) - 1))^2) #Brier score - 0.190
+LogLossBinary((as.numeric(clean_test$state_bi) - 1), gbm_preds_ub_tun_prob) #Log-loss of 0.560
+```
+Variable importance stayed unchanged, while the performance of the model, on the other hand, increased in all of our three metrics. The final AUC reaches 0.748, the Brier score reaches 0.190, and the log-loss reaches 0.560. These values indicate, that the tuned GBM model is by far the best performing model so far.
+
+
+### XGBoost
+
+The final learning algorithm we are going to use for our analysis is XGBoost. We begin by transforming the balanced dataset into a suitable format.
+
+
+```{r, class.source = "fold-hide"}
+#####XGBoost
+#Used the process described in https://www.kaggle.com/rtatman/machine-learning-with-xgboost-in-r
+
+xgtrain_data <- clean_over %>%
+  select(-c(state_bi, category, country)) #We remove any non numeric variables and target variable
+
+xgtrain_data_lab <- clean_over$state_bi #We save the labels separately so that they don't interfere
+categories <- model.matrix(~category + country -1, clean_over) #We one-hot encode categorical variables to transform them to numerical
+
+xgtrain_data_num <- cbind(xgtrain_data, categories) #We combine the two datasets
+xgtrain_data_mat <- data.matrix(xgtrain_data_num) #And transform it into a matrix
+
+xgtrain <- xgb.DMatrix(data = xgtrain_data_mat, label = as.numeric(as.character(xgtrain_data_lab))) #We transform the data into an xgb.DMatrix format for better processing
+xgtest <- xgb.DMatrix(data = test_mm_mat, label = as.numeric(as.character(test_mm_data_lab))) #Same for the test data
+```
+
+Next, we train the model on the balanced dataset.
+```{r, warning=FALSE}
+set.seed(2008)
+xg_bal_model   <- xgboost(xgtrain,         #We train the XgBoost algorithm
+                          max.depth = 6,
+                          nround = 3000,
+                          early_stopping_rounds = 5, #We add early stopping rounds if the algorithm stabilizes
+                          objective = "binary:logistic",  
+                          gamma = 0,
+                          verbose = 0)
+```
+
+
+Next, we examine the model and the variable importance.
+```{r, message=FALSE, collapse=TRUE, class.source = "fold-hide"}
+print(xg_bal_model)
+
+im_xgbal <- xgb.importance(names(xgtrain_data_mat), model = xg_bal_model)
+im_xgbal[1:10, ] #We see usd_goal_real as the most important feature, followed by duration, launch_year and ovrl_sen
+xgb.plot.importance(im_xgbal[1:20, ])
+```
+
+We see that the model reached 3000 iterations and stopped at a log-loss value of 0.421 on the training data. Such a low log-loss value compared to the previous methods hints at overfitting. The importance values are most significantly influenced by the goal amount, followed by duration, launch year, and overall sentiment.
+
+Next, we will use the model to make predictions on the test set and calculate our performance metrics.
+```{r, message=FALSE, collapse=TRUE}
+xg_bal_preds_prob <- predict(xg_bal_model, xgtest) #We make predictions on the test set
+
+auc(clean_test$state_bi, xg_bal_preds_prob) #The AUC of the model reaches 0.723
+mean((xg_bal_preds_prob - (as.numeric(clean_test$state_bi) - 1))^2) #We reach a Brier score of 0.211
+LogLossBinary((as.numeric(clean_test$state_bi) - 1), xg_bal_preds_prob) #The Log-loss is 0.620
+```
+The log-loss calculated on the test data expectedly reaches higher values of 0.620, which confirms that the model overfit the training data. The overall results with the default model, despite being slightly worse than the results from gbm, nevertheless, seem encouraging, so we continue with the unbalanced dataset.
+
+We begin by transforming the data. We also save the ratio between the occurrences of the classes, which we will use in training.
+```{r, message=FALSE, class.source = "fold-hide"}
+######################### Using the unbalanced dataset
+xgtrain_ub <- xgb.DMatrix(data = train_mm_mat_ub, label = as.numeric(as.character(train_mm_lab_ub))) #Transforming the data into an xgb.DMatrix format
+
+negative_cases_ub <- sum(train_mm_lab_ub == 0) #We isolate the negative and positive cases for later use
+positive_cases_ub <- sum(train_mm_lab_ub == 1)
+```
+
+We train the XGBoost algorithm on our unbalanced dataset and add a scale_pos_weight argument, which weighs our data according to the class imbalance.
+```{r, warning=FALSE, message=FALSE}
+set.seed(2011)
+xg_ub_model <- xgboost(xgtrain_ub,              #We train a xgboost model on the unbalanced dataset
+                       max.depth = 6,
+                       nround = 3000,
+                       early_stopping_rounds = 5,
+                       objective = "binary:logistic",
+                       scale_pos_weight = negative_cases_ub/positive_cases_ub,
+                       verbose = 0)
+```
+
+We examine it and take a look at the variable importance.
+```{r, message=FALSE, collapse=TRUE, class.source = "fold-hide"}
+print(xg_ub_model) #After 3000 iterations we get a logloss value of 0.450
+
+im_xgub <- xgb.importance(names(train_mm_mat_ub), model = xg_ub_model)
+im_xgub[1:10, ] #We see very similar trends as on the balanced dataset
+xgb.plot.importance(im_xgub[1:20, ])
+```
+
+Examining the model, we see the log-loss on the training data reached 0.450 after 3000 iterations. It is a low value, suggesting some overfitting, but it seems it might have overfit less than on the balanced data. Examining the variable importance, it remains practically unchanged.
+
+We continue by making the predictions on the test set and calculating the model metrics.
+```{r, message=FALSE, collapse=TRUE}
+xg_ub_preds <- predict(xg_ub_model, xgtest) #We make predictions on the test set
+
+auc(clean_test$state_bi, xg_ub_preds) #The model gives us an AUC value of 0.730
+mean((xg_ub_preds - (as.numeric(clean_test$state_bi) - 1))^2) #Brier score of 0.211
+LogLossBinary((as.numeric(clean_test$state_bi) - 1), xg_ub_preds) #The Log-loss is 0.615
+
+```
+The resulting metrics tell us that the model performed significantly better than the one trained on the balanced dataset.
+
+
+### _Hyperparameter tuning for XGBoost_
+
+In order to get even more accurate results, we will tune the model using the package mlr3. The parameters we will be tuning are max_depth, gamma, min_child_weight, and eta. We are going to be maximizing the AUC value.
+```{r, warning=FALSE, message=FALSE}
+##### TUNING THE XGBOOST MODEL
+getOption("lgr.log_levels")
+lgr::get_logger("mlr3")$set_threshold("warn")
+
+lrn1 <- lrn("classif.xgboost", predict_type = "prob") #We define the learner to be xgboost
+lrn1 <- po("encode") %>>% lrn1 #As xgboost has trouble with factors, we convert them
+
+traintask_ub <- as_task_classif(x = clean_train, target = "state_bi") #We create the task object
+
+rsmpl <- rsmp("cv", folds = 3)
+
+ss <- ps(classif.xgboost.max_depth = p_int(lower = 2, upper = 10),
+         classif.xgboost.gamma = p_int(lower = 0, upper = 10),
+         classif.xgboost.min_child_weight = p_int(lower = 1, upper = 10),
+         classif.xgboost.eta = p_dbl(lower = 0, upper = 1)
+         )
+
+instance_prob_ub <- TuningInstanceSingleCrit$new(task = traintask_ub, learner = lrn1, resampling = rsmpl,
+                                                 measure = msr("classif.auc"), search_space = ss,
+                                                 terminator =  trm("evals", n_evals = 150))
+
+tuner <- tnr("grid_search")
+```
+
+Next we activate the tuner.
+```{r, message=FALSE, class.source = "fold-hide", results='hide'}
+set.seed(2010)
+tuner$optimize(instance_prob_ub)
+```
+
+```{r, message=FALSE, class.source = "fold-hide"}
+instance_prob_ub$result
+```
+The tuning results show the optimal results are max_depth = 10, gamma = 10, min_child_weight = 8, eta = 0.667. So we plug these in and train another model on our unbalanced data.
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(2012)
+xg_ub_model_tun <- xgboost(xgtrain_ub,              #We train the tuned model on the unbalanced dataset
+                           max.depth = 10,
+                           nround = 3000,
+                           early_stopping_rounds = 5,
+                           objective = "binary:logistic",
+                           scale_pos_weight = negative_cases_ub/positive_cases_ub,
+                           gamma = 10,
+                           min_child_weight = 8,
+                           eta = 0.667,
+                           verbose = 0)
+```
+
+We print the model and check the variable importance.
+```{r, message=FALSE, collapse=TRUE}
+print(xg_ub_model_tun) 
+
+im_xgub_tun <- xgb.importance(names(train_mm_mat_ub), model = xg_ub_model_tun)
+im_xgub_tun[1:10, ] #Again very similar
+xgb.plot.importance(im_xgub_tun[1:20, ])
+```
+
+The model reached 123 iterations and a log-loss value of 0.581. This is the first instance that the model stopped before reaching the full 3000 iterations, and the log-loss seems reasonable, implying we didn't overfit the training data too much.
+
+We continue by making predictions and calculating the metrics.
+```{r, message=FALSE, warning=FALSE, collapse=TRUE}
+xg_ub_preds_tun <- predict(xg_ub_model_tun, xgtest) #We make predictions on the test set
+
+auc(clean_test$state_bi, xg_ub_preds_tun) #The model gives us an AUC value of 0.748
+mean((xg_ub_preds_tun - (as.numeric(clean_test$state_bi) - 1))^2) #Brier score of 0.204
+LogLossBinary((as.numeric(clean_test$state_bi) - 1), xg_ub_preds_tun) #The log-loss is 0.591
+```
+Assessing the resulting metrics from the tuned model fit on the unbalanced data, we see that the tuned model outperformed the untuned model in every performance metric. The performance values of AUC = 0.748, Brier score of 0.204, and the log-loss score of 0.591 are good, however, they are still slightly worse than the results we got using the tuned GBM model.
+
+
+### MODEL PERFORMANCE COMPARISON
+
+Finally. we create a table for a comparison between models. We begin with the table containing the performance of the models trained on the balanced dataset.
+```{r, warning=FALSE, message=FALSE, class.source = "fold-hide"}
+#Comparison of AUC and Brier values between the models
+
+final_table_balanced <- data.frame(c(auc(test_data$state_bi, naive_preds), #Naive AUC
+                                     mean((naive_preds - (as.numeric(test_data$state_bi) - 1))^2), #Naive Brier 
+                                     LogLossBinary((as.numeric(test_data$state_bi) - 1), naive_preds_probs)), #Naive Log-loss
+                                   
+                                   c(auc(test_data$state_bi, logipreds_prob), #GLM AUC
+                                     mean((logipreds_prob - (as.numeric(clean_test$state_bi) - 1))^2), #GLM Brier
+                                     LogLossBinary((as.numeric(clean_test$state_bi) - 1), logipreds_prob)), #GLM Log-loss
+                                   c(auc(clean_test2$state_bi, kick_rf_preds_prob[, 2]), #RF AUC 
+                                     mean((kick_rf_preds_prob[, 2] - (as.numeric(clean_test2$state_bi) - 1))^2),#RF Brier
+                                     LogLossBinary((as.numeric(clean_test2$state_bi) - 1), kick_rf_preds_prob[, 2])), #RF Log-loss 
+                                  
+                                    c(auc(clean_test$state_bi, gbm_preds_prob), #GBM AUC
+                                     mean((gbm_preds_prob - (as.numeric(clean_test$state_bi) - 1))^2), #GBM Brier
+                                     LogLossBinary((as.numeric(clean_test$state_bi) - 1), gbm_preds_prob)), #GBM Log-loss
+                                   
+                                   c(auc(clean_test$state_bi, xg_bal_preds_prob), #XGBoost AUC
+                                     mean((xg_bal_preds_prob - (as.numeric(clean_test$state_bi) - 1))^2), #Xgboost Brier 
+                                     LogLossBinary((as.numeric(clean_test$state_bi) - 1), xg_bal_preds_prob))) #XGBoost Log-loss
+
+
+colnames(final_table_balanced) <- c("Naive model", "Logistic Regression", "Random Forest", "GBM", "XGBoost")
+rownames(final_table_balanced) <- c("AUC Values", "Brier scores", "Log-loss values")
+
+final_table_balanced
+```
+Looking at the results, we can see that the GBM model performed the best. Logistic regression and XGBoost both performed good, resulting in improvements in all of the metrics compared to the baseline naive model. Random forest on the other hand, performed poorly.
+
+Next, we continue with the table of models, trained on unbalanced data.
+```{r, warning=FALSE, message=FALSE, class.source = "fold-hide"}
+
+final_table_unbalanced <- data.frame(c(auc(test_data$state_bi, naive_preds), #Naive AUC U
+                                 mean((naive_preds - (as.numeric(test_data$state_bi) - 1))^2),#Naive Brier  U
+                                 LogLossBinary((as.numeric(test_data$state_bi) - 1), naive_preds_probs)), #Naive Log-loss U
+                               c(auc(test_data$state_bi, logipreds_prob_ub), #GLM AUC U
+                                mean((logipreds_prob_ub - (as.numeric(clean_test$state_bi) - 1))^2), #GLM Brier U
+                                LogLossBinary((as.numeric(clean_test$state_bi) - 1), logipreds_prob_ub)), #GLM Log-loss U
+                               
+                               c(auc(test_data$state_bi, logipreds_prob_reg_ub), #Ridge GLM AUC
+                                mean((logipreds_prob_reg_ub - (as.numeric(clean_test$state_bi) - 1))^2), #Ridge GLM Brier
+                                LogLossBinary((as.numeric(clean_test$state_bi) - 1), logipreds_prob_reg_ub)), #Ridge GLM Log-loss
+                               c(auc(test_data$state_bi, as.numeric(kick_rf_preds_prob_ub[, 2]) - 1), #RF AUC U
+                                mean((kick_rf_preds_prob_ub[, 2] - (as.numeric(test_data$state_bi) - 1))^2), #RF Brier U
+                                LogLossBinary((as.numeric(clean_test$state_bi) - 1), kick_rf_preds_prob_ub[, 2])), #RF Log-loss U
+                               c(auc(test_data$state_bi, gbm_preds_ub_prob), #GBM AUC U
+                                mean((gbm_preds_ub_prob - (as.numeric(test_data$state_bi) - 1))^2), #GBM Brier U
+                                LogLossBinary((as.numeric(clean_test$state_bi) - 1), gbm_preds_ub_prob)), #GBM Log-loss U
+                              
+                                c(auc(clean_test$state_bi, gbm_preds_ub_tun_prob), #GBM AUC U TUNED
+                                mean((gbm_preds_ub_tun_prob - (as.numeric(clean_test$state_bi) - 1))^2), #GBM U TUNED Brier
+                                LogLossBinary((as.numeric(clean_test$state_bi) - 1), gbm_preds_ub_tun_prob)), #GBM U TUNED Log-loss
+                               
+                               c(auc(clean_test$state_bi, xg_ub_preds), #XGBoost AUC U
+                                mean((xg_ub_preds - (as.numeric(clean_test$state_bi) - 1))^2), #Xgboost Brier  U
+                                LogLossBinary((as.numeric(clean_test$state_bi) - 1), xg_ub_preds)), #XGBoost Log-loss U
+                               
+                               c(auc(clean_test$state_bi, xg_ub_preds_tun), #Tuned xgboost AUC U
+                                mean((xg_ub_preds_tun - (as.numeric(clean_test$state_bi) - 1))^2),#Tuned xgboost Brier U
+                                LogLossBinary((as.numeric(clean_test$state_bi) - 1), xg_ub_preds_tun)) #Tuned XGBoost  Log-loss U
+)
+
+colnames(final_table_unbalanced) <- c("Naive model UB", "Logistic Regression UB", "Logistic Regression UB with Ridge Regularization", "Random Forest UB", "GBM UB", "GBM Tuned UB", "XGBoost UB", "XGBoost Tuned UB")
+rownames(final_table_unbalanced) <- c("AUC Values", "Brier scores", "Log-loss values")
+
+final_table_unbalanced
+```
+Analyzing the output of the final table, we see much the same picture. All across the board, the models trained on unbalanced data, performed better than the ones trained on balanced data. The best performing model was the tuned GBM model, with values of AUC = 0.748, Brier score of 0.190, and log-loss value of 0.560, which are great improvements over the naive model. As before, logistic regression and XGBoost performed well, being slightly less effective as GBM. Random forest performed poorly on the unbalanced dataset as well.
+
+In conclusion, the best performing model on our data is the tuned, unbalanced GBM model.
+
+
+### PREDICTION FUNCTIONS
+
+For the end, we will write two predict functions for direct input of new data and try them out on two examples.
+
+First, we will write one that uses the XGBoost tuned model that was trained on the unbalanced data. XGBoost performs poorly on parameter values it hasn't yet encountered such as really high goal amounts or years in the future. Therefore, for accurate predictions, use values in normal ranges and years up to 2017.
+```{r, warning=FALSE, message=FALSE, class.source = "fold-hide"}
+###################### Prediction function XgBoost
+
+
+kickstarter_predict_xg <- function(category, country, goal_usd, launch_year, project_name, duration) {
+  
+  if(class(category) != "character") stop("category should be a character vector")
+  if(!category %in% levels(clean_test$category)) stop("The entered category is not valid. Valid entries are: \n", print_and_capture(levels(clean_test$category)))
+  if(class(country) != "character") stop("country should be a character vector")
+  if(!country %in% levels(clean_test$country)) stop("The entered country is not valid. Valid entries are: \n", print_and_capture(levels(clean_test$country)))
+  if(class(goal_usd) != "numeric") stop("goal_usd should be a numeric value")
+  if(class(launch_year) != "numeric") stop("launch_year should be a numeric value")
+  if(launch_year < 2009) stop("Kickstarter would definitely be revolutionary if it was lunched in ", launch_year,", however it was lunched in 2009 so please choose a year from 2009 onwards :)")
+  if(class(project_name) != "character") stop("project_name should be a character vector")
+  if(class(duration) != "numeric") stop("duration should be a numeric value")
+  
+  start_list <- clean_test[0, ] %>%
+    select(-state_bi)
+  
+  sentscore <- data.frame(name = c("good and bad", project_name)) %>% 
+    unnest_tokens(word, name) %>%
+    inner_join(get_sentiments("afinn"), by = "word") %>%
+    summarise(total = sum(value))
+  
+  start_list[1, ] <- list(category = category,
+                           country = country,
+                           usd_goal_real = goal_usd,
+                           launch_year = launch_year,
+                           ovrl_sen = sentscore[1,1],
+                           duration = duration)
+  
+  cat_mat <-  model.matrix(~category + country -1, start_list)
+  
+  dat_mat <- start_list %>%
+    select(-c(category, country))
+  
+  alldata <- cbind(dat_mat, cat_mat)
+  alldataxgb <- xgb.DMatrix(as.matrix(alldata))
+  
+  predict(xg_ub_model_tun, alldataxgb)
+  
+}
+```
+
+We try to predict the probabilities of success in launching a drink called "The Worst Disgusting Drink Ever" in 2015 with a goal of 40,000 USD and a duration of 30 days.
+```{r}
+kickstarter_predict_xg(category = "Drinks",
+                        country = "US",
+                        goal_usd =  40000,
+                        launch_year = 2015,
+                        project_name = "The Worst Disgusting Drink Ever",
+                        duration = 30)
+
+```
+
+Next, we write the function that uses the tuned GBM, which is the model that performed the best in our set of models. As with XGBoost, it performs poorly on parameters it hasn't yet encountered (extreme goal amounts, years in the future, and such), so for accurate predictions we need to use sensible parameters and years up to 2017.
+```{r, warning=FALSE, message=FALSE, class.source = "fold-hide"}
+### Prediction function logistic regression
+
+kickstarter_predict_gbm <- function(category, country, goal_usd, launch_year, project_name, duration, n.trees = 2000) {
+  
+  if(class(category) != "character") stop("category should be a character vector")
+  if(!category %in% levels(clean_test$category)) stop("The entered category is not valid. Valid entries are: \n", print_and_capture(levels(clean_test$category)))
+  if(class(country) != "character") stop("country should be a character vector")
+  if(!country %in% levels(clean_test$country)) stop("The entered country is not valid. Valid entries are: \n", print_and_capture(levels(clean_test$country)))
+  if(class(goal_usd) != "numeric") stop("goal_usd should be a numeric value")
+  if(class(launch_year) != "numeric") stop("launch_year should be a numeric value")
+  if(launch_year < 2009) stop("Kickstarter would definitely be revolutionary if it was lunched in ", launch_year,", however it was lunched in 2009 so please choose a year from 2009 onwards :)")
+  if(class(project_name) != "character") stop("project_name should be a character vector")
+  if(class(duration) != "numeric") stop("duration should be a numeric value")
+  
+  sentscore <- data.frame(name = c("good and bad", project_name)) %>% 
+    unnest_tokens(word, name) %>%
+    inner_join(get_sentiments("afinn"), by = "word") %>%
+    summarise(total = sum(value))
+  
+  newdata <- train_data_gbm_ub[1, ]
+  
+  newdata[1, ] <- data.frame(category = category,
+                             country = country,
+                             usd_goal_real = goal_usd,
+                             state_bi = 0,
+                             launch_year = launch_year,
+                             ovrl_sen = sentscore[1,1],
+                             duration = duration)
+  
+  predict.gbm(kick_gbm_ub_tun, type = "response", n.trees, newdata = newdata)
+  
+}
+
+```
+
+We use the GBM predict function to predict the success probability for the same project as we did with XGBoost.
+
+```{r}
+kickstarter_predict_gbm(category = "Drinks",
+                        country = "US",
+                        goal_usd =  40000,
+                        launch_year = 2015,
+                        project_name = "The Worst Disgusting Drink Ever",
+                        duration = 30)
+
+
+```
+
+
+Finally, we write a prediction function for logistic regression, which tends to perform better on future data. So in this case, besides using more extreme goal values, we can also, importantly, extrapolate the model to future data.
+
+```{r, warning=FALSE, message=FALSE, class.source = "fold-hide"}
+### Prediction function logistic regression
+
+kickstarter_predict_glm <- function(category, country, goal_usd, launch_year, project_name, duration) {
+  
+  if(class(category) != "character") stop("category should be a character vector")
+   if(!category %in% levels(clean_test$category)) stop("The entered category is not valid. Valid entries are: \n", print_and_capture(levels(clean_test$category)))
+  if(class(country) != "character") stop("country should be a character vector")
+    if(!country %in% levels(clean_test$country)) stop("The entered country is not valid. Valid entries are: \n", print_and_capture(levels(clean_test$country)))
+  if(class(goal_usd) != "numeric") stop("goal_usd should be a numeric value")
+  if(class(launch_year) != "numeric") stop("launch_year should be a numeric value")
+    if(launch_year < 2009) stop("Kickstarter would definitely be revolutionary if it was lunched in ", launch_year,", however it was lunched in 2009 so please choose a year from 2009 onwards :)")
+  if(class(project_name) != "character") stop("project_name should be a character vector")
+  if(class(duration) != "numeric") stop("duration should be a numeric value")
+  
+  sentscore <- data.frame(name = c("good and bad", project_name)) %>% 
+    unnest_tokens(word, name) %>%
+    inner_join(get_sentiments("afinn"), by = "word") %>%
+    summarise(total = sum(value))
+  
+  predict.glm(logi_mod_ub, type = "response", newdata = data.frame(category = category,
+                                                                   country = country,
+                                                                   usd_goal_real = goal_usd,
+                                                                   launch_year = launch_year,
+                                                                   ovrl_sen = sentscore[1,1],
+                                                                   duration = duration))
+  
+}
+
+```
+
+We try to predict the probabilities of a successful launch of a restaurant called "The Delightful Cosy Fragrant Carpet" in the US in the year 2025 with a funding goal of 150,000 USD.
+```{r}
+kickstarter_predict_glm(category = "Restaurants",
+                        country  = "US",
+                        goal_usd = 150000,
+                        launch_year = 2025,
+                        project_name = "The Delightful Cosy Fragrant Carpet",
+                        duration = 30)
+
+
+```
+
