@@ -5,11 +5,13 @@ library(tidytext)
 library(assertive.base)
 library(gbm)
 library(xgboost)
+library(UPG)
+library(caret)
 
 filepath <- "D:/Users/Gregor/Desktop/Kaggle/Kickstarter projects/ks-projects-201801.csv" 
 kickstarter_data <- read_csv(filepath, col_names = T)
 
-kickstarter_data <- kickstarter_data[sample(nrow(kickstarter_data), 10000), ]
+kickstarter_data <- kickstarter_data[sample(nrow(kickstarter_data), 50000), ]
 
 kickstarter_data <- kickstarter_data %>%
   mutate(category = factor(category),
@@ -92,6 +94,58 @@ kickxg <- xgboost(clean_xgtrain,              #We train the tuned model on the u
                            eta = 0.667,
                            verbose = 0)
 kickxg
+
+baydat <- clean_train %>%
+  mutate(goal_bin = case_when(usd_goal_real < 5000 ~ '< 5000',
+                              usd_goal_real < 20000 ~ 'between 5000 and 20000',
+                              usd_goal_real < 100000 ~ 'between 20000 and 100000',
+                              usd_goal_real < 1000000 ~ 'between 100000 and 1000000',
+                              usd_goal_real >= 1000000 ~ 'over 1000000'),
+         sentiment_bins = case_when(ovrl_sen < -5 ~ 'very negative',
+                                    ovrl_sen < 0 ~ 'negative',
+                                    ovrl_sen == 0 ~ 'neutral',
+                                    ovrl_sen < 5 ~ 'positive',
+                                    ovrl_sen >= 5 ~ 'very_positive'),
+         duration_bin = case_when(duration < 30 ~ 'short',
+                                  duration < 60 ~ 'standard',
+                                  duration >= 60 ~'long'))
+
+baydat <- baydat %>%
+  mutate(launch_year = as.factor(launch_year),
+         goal_bin = as.factor(goal_bin),
+         sentiment_bins = as.factor(sentiment_bins),
+         duration_bin = as.factor(duration_bin))
+
+baydat <- baydat[, c(-3,-6,-7)]
+
+baydat <- baydat %>%
+  group_by(category, country, launch_year, goal_bin, sentiment_bins, duration_bin) %>%
+  summarise(category = category, country = country, launch_year = launch_year,
+            goal_bin = goal_bin, sentiment_bins = sentiment_bins, duration_bin = duration_bin,
+            total = n(), successful = sum(as.numeric(state_bi) - 1)) %>%
+  ungroup()
+
+baydat <- unique(baydat)
+
+intercept <- rep(1, nrow(baydat))
+
+baydat <- cbind(intercept, baydat)
+
+y <- baydat[, 9]
+Ni <- baydat[, 8]
+X <- baydat[, c(-8,-9)]
+
+bay_form <- dummyVars(~ category + country + launch_year + goal_bin + sentiment_bins + duration_bin,
+                      data = baydat,
+                      levelsOnly = F)
+
+baydum <- as_tibble(predict(bay_form, newdata = baydat))
+
+baydum <- cbind(intercept, baydum)
+
+
+kickbay <- UPG(y = y, Ni = Ni, X = baydum, model = "binomial")
+
 
 kickstarter_predict_glm <- function(category, country, goal_usd, launch_year, project_name, duration) {
   
@@ -189,6 +243,55 @@ kickstarter_predict_xg <- function(category, country, goal_usd, launch_year, pro
   predict(kickxg, alldataxgb)
   
 }
+
+
+kickstarter_predict_bay <- function(category, country, goal_usd, launch_year, project_name, duration) {
+  
+  if(class(category) != "character") stop("category should be a character vector")
+  if(!category %in% levels(clean_train$category)) stop("The entered category is not valid. Valid entries are: \n", print_and_capture(levels(clean_train$category)))
+  if(class(country) != "character") stop("country should be a character vector")
+  if(!country %in% levels(clean_train$country)) stop("The entered country is not valid. Valid entries are: \n", print_and_capture(levels(clean_train$country)))
+  if(class(goal_usd) != "numeric") stop("goal_usd should be a numeric value")
+  if(class(launch_year) != "numeric") stop("launch_year should be a numeric value")
+  if(launch_year < 2009) stop("Kickstarter would definitely be revolutionary if it was lunched in ", launch_year,", however it was lunched in 2009 so please choose a year from 2009 onwards :)")
+  if(class(project_name) != "character") stop("project_name should be a character vector")
+  if(class(duration) != "numeric") stop("duration should be a numeric value")
+
+  
+  sentscore <- data.frame(name = c("good and bad", project_name)) %>% 
+    unnest_tokens(word, name) %>%
+    inner_join(get_sentiments("afinn"), by = "word") %>%
+    summarise(total = sum(value))
+  
+  newobs <- data.frame(category = category,
+                       country = country,
+                       usd_goal_real = goal_usd,
+                       launch_year = as.factor(launch_year),
+                       ovrl_sen = sentscore[1,1],
+                       duration = duration)
+
+  newobs <- newobs %>%
+    mutate(goal_bin = case_when(usd_goal_real < 5000 ~ '< 5000',
+                                usd_goal_real < 20000 ~ 'between 5000 and 20000',
+                                usd_goal_real < 100000 ~ 'between 20000 and 100000',
+                                usd_goal_real < 1000000 ~ 'between 100000 and 1000000',
+                                usd_goal_real >= 1000000 ~ 'over 1000000'),
+           sentiment_bins = case_when(ovrl_sen < -5 ~ 'very negative',
+                                      ovrl_sen < 0 ~ 'negative',
+                                      ovrl_sen == 0 ~ 'neutral',
+                                      ovrl_sen < 5 ~ 'positive',
+                                      ovrl_sen >= 5 ~ 'very_positive'),
+           duration_bin = case_when(duration < 30 ~ 'short',
+                                    duration < 60 ~ 'standard',
+                                    duration >= 60 ~'long'))
+
+  newobs <- as_tibble(predict(bay_form, newdata = newobs))
+  newobs <- cbind(intercept = intercept[1], newobs[1, ])
+  
+  predict(kickbay, newdata = newobs, q =c(0.05, 0.95))
+  
+}
+
 #-------------------------------------------
 
 ui <- fluidPage(
